@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useSession, signOut } from "next-auth/react";
 import AppHeader from "@/components/AppHeader";
 import NotesSidebar from "@/components/notes/NotesSidebar";
 import NoteEditor from "@/components/notes/NoteEditor";
@@ -9,7 +9,6 @@ import Topbar from "@/components/notes/Topbar";
 import ShareModal from "@/components/notes/ShareModal";
 import ConfirmModal from "@/components/ConfirmModal";
 import MoveNoteModal from "@/components/MoveNoteModal";
-import { mockNotes, mockFolders } from "@/lib/mock-data";
 import { Note, Folder } from "@/lib/types";
 import { relativeTime } from "@/lib/utils";
 
@@ -18,73 +17,51 @@ type PendingDelete =
   | { type: "folder"; id: string; name: string };
 
 export default function DashboardPage() {
-  const router = useRouter();
+  const { data: session, update: updateSession } = useSession();
 
-  // ─── Persisted state ─────────────────────────────────────────────────────────
+  // ─── Data state ───────────────────────────────────────────────────────────────
 
-  const [notes, setNotes] = useState<Note[]>(() => {
-    if (typeof window === "undefined") return mockNotes;
-    try {
-      const saved = localStorage.getItem("syncnotes-notes");
-      return saved ? JSON.parse(saved) : mockNotes;
-    } catch {
-      return mockNotes;
+  const [notes, setNotes] = useState<Note[]>([]);
+  const [folders, setFolders] = useState<Folder[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+
+  useEffect(() => {
+    async function load() {
+      const [notesRes, foldersRes] = await Promise.all([
+        fetch("/api/notes"),
+        fetch("/api/folders"),
+      ]);
+      const [notesData, foldersData] = await Promise.all([
+        notesRes.json(),
+        foldersRes.json(),
+      ]);
+      setNotes(notesData);
+      setFolders(foldersData);
+      setSelectedNoteId(notesData[0]?.id ?? null);
+      setIsLoading(false);
     }
-  });
-
-  const [folders, setFolders] = useState<Folder[]>(() => {
-    if (typeof window === "undefined") return mockFolders;
-    try {
-      const saved = localStorage.getItem("syncnotes-folders");
-      return saved ? JSON.parse(saved) : mockFolders;
-    } catch {
-      return mockFolders;
-    }
-  });
-
-  useEffect(() => {
-    localStorage.setItem("syncnotes-notes", JSON.stringify(notes));
-  }, [notes]);
-
-  useEffect(() => {
-    localStorage.setItem("syncnotes-folders", JSON.stringify(folders));
-  }, [folders]);
-
-  // ─── User session ─────────────────────────────────────────────────────────────
-
-  const [userName, setUserName] = useState("Gast");
-  const [userEmail, setUserEmail] = useState("");
-
-  useEffect(() => {
-    try {
-      const session = localStorage.getItem("syncnotes-session");
-      if (session) {
-        const { name, email } = JSON.parse(session);
-        if (name) setUserName(name);
-        if (email) setUserEmail(email);
-      }
-    } catch { /* ignore */ }
+    load();
   }, []);
 
-  const handleLogout = () => {
-    localStorage.removeItem("syncnotes-session");
-    router.push("/login");
-  };
+  // ─── User ─────────────────────────────────────────────────────────────────────
 
-  const handleNameChange = (name: string) => {
-    setUserName(name);
-    try {
-      const session = localStorage.getItem("syncnotes-session");
-      const parsed = session ? JSON.parse(session) : {};
-      localStorage.setItem("syncnotes-session", JSON.stringify({ ...parsed, name }));
-    } catch { /* ignore */ }
+  const userName = session?.user?.name ?? "Gast";
+  const userEmail = session?.user?.email ?? "";
+
+  const handleLogout = () => signOut({ callbackUrl: "/login" });
+
+  const handleNameChange = async (name: string) => {
+    await fetch("/api/user", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    await updateSession({ name });
   };
 
   // ─── UI state ────────────────────────────────────────────────────────────────
 
-  const [selectedNoteId, setSelectedNoteId] = useState<string | null>(
-    () => notes[0]?.id ?? null
-  );
+  const [selectedNoteId, setSelectedNoteId] = useState<string | null>(null);
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<PendingDelete | null>(null);
@@ -104,6 +81,8 @@ export default function DashboardPage() {
 
   // ─── Note handlers ────────────────────────────────────────────────────────────
 
+  const saveTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const handleContentChange = (value: string) => {
     setNotes((prev) =>
       prev.map((note) =>
@@ -112,6 +91,16 @@ export default function DashboardPage() {
           : note
       )
     );
+    if (saveTimeout.current) clearTimeout(saveTimeout.current);
+    saveTimeout.current = setTimeout(() => {
+      if (selectedNoteId) {
+        fetch(`/api/notes/${selectedNoteId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: value }),
+        });
+      }
+    }, 800);
   };
 
   const handleTitleChange = (title: string) => {
@@ -122,22 +111,27 @@ export default function DashboardPage() {
           : note
       )
     );
+    if (selectedNoteId) {
+      fetch(`/api/notes/${selectedNoteId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title }),
+      });
+    }
   };
 
-  const handleCreateNote = (folderId: string | null) => {
-    const newNote: Note = {
-      id: crypto.randomUUID(),
-      title: "Neue Notiz",
-      content: "",
-      updatedAt: new Date().toISOString(),
-      isShared: false,
-      folderId,
-    };
+  const handleCreateNote = async (folderId: string | null) => {
+    const res = await fetch("/api/notes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "Neue Notiz", content: "", folderId }),
+    });
+    const newNote: Note = await res.json();
     setNotes((prev) => [newNote, ...prev]);
     setSelectedNoteId(newNote.id);
   };
 
-  const handleMoveNote = (folderId: string | null) => {
+  const handleMoveNote = async (folderId: string | null) => {
     setNotes((prev) =>
       prev.map((n) =>
         n.id === selectedNoteId
@@ -145,6 +139,13 @@ export default function DashboardPage() {
           : n
       )
     );
+    if (selectedNoteId) {
+      await fetch(`/api/notes/${selectedNoteId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ folderId }),
+      });
+    }
     setIsMoveModalOpen(false);
   };
 
@@ -159,16 +160,21 @@ export default function DashboardPage() {
     URL.revokeObjectURL(url);
   };
 
-  // Mark note as shared when link is copied
   const handleNoteShared = () => {
     setNotes((prev) =>
       prev.map((n) =>
         n.id === selectedNoteId ? { ...n, isShared: true } : n
       )
     );
+    if (selectedNoteId) {
+      fetch(`/api/notes/${selectedNoteId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ isShared: true }),
+      });
+    }
   };
 
-  // Request delete → shows confirmation modal
   const handleRequestDeleteNote = (id: string) => {
     const note = notes.find((n) => n.id === id);
     if (note) setPendingDelete({ type: "note", id, name: note.title });
@@ -179,8 +185,7 @@ export default function DashboardPage() {
     if (folder) setPendingDelete({ type: "folder", id, name: folder.name });
   };
 
-  // Execute delete after confirmation
-  const handleConfirmDelete = () => {
+  const handleConfirmDelete = async () => {
     if (!pendingDelete) return;
 
     if (pendingDelete.type === "note") {
@@ -189,6 +194,7 @@ export default function DashboardPage() {
       if (selectedNoteId === pendingDelete.id) {
         setSelectedNoteId(remaining[0]?.id ?? null);
       }
+      await fetch(`/api/notes/${pendingDelete.id}`, { method: "DELETE" });
     } else {
       const getFolderIds = (folderId: string): string[] => {
         const children = folders.filter((f) => f.parentId === folderId);
@@ -206,6 +212,14 @@ export default function DashboardPage() {
       if (selectedNoteId && noteIdsToDelete.has(selectedNoteId)) {
         setSelectedNoteId(remainingNotes[0]?.id ?? null);
       }
+      await Promise.all([
+        ...[...folderIdsToDelete].map((id) =>
+          fetch(`/api/folders/${id}`, { method: "DELETE" })
+        ),
+        ...[...noteIdsToDelete].map((id) =>
+          fetch(`/api/notes/${id}`, { method: "DELETE" })
+        ),
+      ]);
     }
 
     setPendingDelete(null);
@@ -213,22 +227,38 @@ export default function DashboardPage() {
 
   // ─── Folder handlers ──────────────────────────────────────────────────────────
 
-  const handleCreateFolder = (parentId: string | null) => {
-    const newFolder: Folder = {
-      id: crypto.randomUUID(),
-      name: "Neuer Ordner",
-      parentId,
-    };
+  const handleCreateFolder = async (parentId: string | null) => {
+    const res = await fetch("/api/folders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Neuer Ordner", parentId }),
+    });
+    const newFolder: Folder = await res.json();
     setFolders((prev) => [...prev, newFolder]);
   };
 
-  const handleRenameFolder = (id: string, name: string) => {
+  const handleRenameFolder = async (id: string, name: string) => {
     setFolders((prev) =>
       prev.map((folder) => (folder.id === id ? { ...folder, name } : folder))
     );
+    await fetch(`/api/folders/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
   };
 
   // ─── Render ───────────────────────────────────────────────────────────────────
+
+  if (isLoading) {
+    return (
+      <div className="flex h-screen items-center justify-center" style={{ background: "var(--s1)" }}>
+        <svg className="animate-spin-slow" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ color: "var(--t3)" }}>
+          <path d="M21 12a9 9 0 1 1-6.219-8.56" strokeLinecap="round" />
+        </svg>
+      </div>
+    );
+  }
 
   return (
     <>

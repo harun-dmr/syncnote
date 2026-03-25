@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import { signIn } from "next-auth/react";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -12,17 +13,48 @@ export default function LoginPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setError("");
     if (!email.trim()) { setError("Bitte gib deine E-Mail-Adresse ein."); return; }
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { setError("Ungültige E-Mail-Adresse."); return; }
     if (password.length < 6) { setError("Passwort muss mindestens 6 Zeichen haben."); return; }
     if (mode === "signup" && !name.trim()) { setError("Bitte gib deinen Namen ein."); return; }
+
     setLoading(true);
-    const displayName = mode === "signup" && name.trim() ? name.trim() : email.split("@")[0] || "Nutzer";
-    localStorage.setItem("syncnotes-session", JSON.stringify({ name: displayName, email }));
-    setTimeout(() => router.push("/dashboard"), 900);
+
+    try {
+      if (mode === "signup") {
+        const res = await fetch("/api/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, name: name.trim(), password }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          setError(data.error || "Registrierung fehlgeschlagen.");
+          setLoading(false);
+          return;
+        }
+      }
+
+      const result = await signIn("credentials", {
+        email,
+        password,
+        redirect: false,
+      });
+
+      if (result?.error) {
+        setError("E-Mail oder Passwort falsch.");
+        setLoading(false);
+        return;
+      }
+
+      router.push("/dashboard");
+    } catch {
+      setError("Verbindungsfehler. Bitte versuche es erneut.");
+      setLoading(false);
+    }
   };
 
   return (
@@ -128,19 +160,11 @@ export default function LoginPage() {
             </button>
           </form>
 
-          {/* Demo hint */}
-          <div className="mt-4 flex items-center gap-2 rounded-xl border border-violet-500/20 bg-violet-500/[0.06] px-4 py-3">
-            <div className="h-1.5 w-1.5 rounded-full bg-violet-400 glow-sm-violet" />
-            <p className="text-xs text-slate-500">
-              <span className="font-medium text-slate-400">Demo:</span> Beliebige Daten eingeben
-            </p>
-          </div>
-
           {/* Toggle */}
           <p className="mt-6 text-center text-sm text-slate-500">
             {mode === "login" ? "Noch kein Konto?" : "Bereits registriert?"}{" "}
             <button
-              onClick={() => setMode(mode === "login" ? "signup" : "login")}
+              onClick={() => { setMode(mode === "login" ? "signup" : "login"); setError(""); }}
               className="font-semibold text-violet-400 transition hover:text-violet-300"
             >
               {mode === "login" ? "Registrieren" : "Einloggen"}
